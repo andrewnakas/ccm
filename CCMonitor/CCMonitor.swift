@@ -574,8 +574,10 @@ struct Row: View {
 
     @State private var breathe = false
 
-    /// Animated by AppKit, so a pulsing dot costs no state updates.
-    var animated: Bool { s.needsYou || s.isWorking }
+    /// Only a session that is blocked on you blinks. Ten working sessions each
+    /// animating a dot forever measured 8% of a core on an 8-core machine — the
+    /// colour already says "working", so it does not need to move.
+    var animated: Bool { s.needsYou }
 
     var color: Color {
         if s.needsYou { return .pink }

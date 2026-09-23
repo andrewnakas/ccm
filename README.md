@@ -139,9 +139,11 @@ CCMonitor says so in a notification rather than waiting to be asked.
 - **Staying cheap**: every source has its own cadence and they all run on one
   serial queue, so a slow pass can never overlap the next tick. Reading session
   JSON is every 2s, `ps` every 6s, `lsof` every 60s, and the AppleScript window
-  inventory — which takes seconds once you have 30+ windows — every 25s and
-  *only while the panel is on screen*. Steady-state cost is about 3% of one
-  core.
+  inventory — which takes 4s once you have 30+ windows — every 25s and *only
+  while the panel is on screen*. Measured steady-state cost with the panel open
+  and a dozen live sessions: **1.8% of one core**. Only a session that needs you
+  animates its dot; ten breathing dots measured 8% of a core on their own, and
+  the colour already says "working".
 
 ## Linux and Windows
 

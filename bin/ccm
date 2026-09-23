@@ -190,8 +190,12 @@ def tail_messages(path, want=14):
 
 _perf = {"at": 0.0, "tree": ({}, {}), "load": (0.0, 1)}
 
-def perf_sample(max_age=5.0):
-    """One ps pass -> per-pid own usage + child map, so a session's whole tree counts."""
+def perf_sample(max_age=12.0):
+    """One ps pass -> per-pid own usage + child map, so a session's whole tree counts.
+
+    Cached hard: `ps -axo` over 500 processes costs ~2s of wall time on a loaded
+    machine, which is far too slow to sit in a 2s refresh loop.
+    """
     if time.time() - _perf["at"] < max_age:
         return _perf
     kids, own = {}, {}
