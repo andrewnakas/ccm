@@ -25,6 +25,10 @@ Everything either tool knows comes from files Claude Code already writes:
 | session status | `status` field | `busy` \| `shell` \| `idle` \| `waiting` |
 | why it is blocked | `waitingFor` field | `dialog open` \| `input needed` \| `goal proposal` \| `sandbox request` |
 
+The CLI also carries a Termux/Android code path (`/data/data/com.termux/…`,
+`TERMUX_VERSION`), so Android-under-Termux is a fourth target the session layer
+already supports — cheap to include in the TUI, no windows to reveal.
+
 Two useful hints that this layer is already platform-aware: sessions carry a
 `pidDomain` field (`darwin` on macOS), and `messagingSocketPath`
 (`/tmp/cc-socks/<pid>.sock` on macOS) — both imply per-platform variants worth
@@ -102,6 +106,7 @@ picking one per OS. Ranked by how exactly they land you where you want to be.
 | Windows Terminal | ✅ | ✅ | ✅ | ❌ (upstream gap) |
 | Windows conhost | ✅ | ✅ | ✅ | ✅ (1 tab per window) |
 | WSL + Windows Terminal | ✅ | ✅ | ✅ | tmux only |
+| Android / Termux | ✅ (see Q2) | ✅ | n/a | tmux only |
 
 ---
 
@@ -185,12 +190,33 @@ These need a machine of each kind; each is a ten-minute check.
 1. **Does Claude Code on Windows write `%USERPROFILE%\.claude\sessions\<pid>.json`
    at all, and what is `pidDomain` there?** The whole plan rests on it. Same
    question for native Linux (expected: `linux`, path unchanged).
-2. **What is `messagingSocketPath` on Windows?** Partly answered by reading the
-   CLI binary: Windows uses named pipes rather than unix sockets — the strings
-   show `\\.\pipe\<name>` construction, pipe names built from `process.pid`,
-   and a daemon pipe pattern `\\.\pipe\cc-daemon-*` (the macOS analogue being
-   `/tmp/cc-socks/<pid>.sock`). The remaining unknown is the exact per-session
-   pipe name, which a Windows install answers in one command:
+2. **Where does the per-session IPC endpoint live on each platform?** Reading
+   the CLI binary's string pool answers most of this, and it is more
+   interesting than expected. Alongside `cc-socks` sit these directory
+   patterns:
+
+   ```
+   /tmp/cc-socks(?:-(0|[1-9]\d*))?$
+   /private/tmp/cc-socks(?:-(0|[1-9]\d*))?$
+   /data/data/com.termux/files/usr/tmp/cc-socks(?:-(0|[1-9]\d*))?$
+   XDG_RUNTIME_DIR   TERMUX_VERSION   PREFIX
+   \\.\pipe\cc-daemon-*        cc-msg-
+   ```
+
+   So a port must *resolve* the endpoint directory rather than hardcode
+   `/tmp/cc-socks`: there is an optional `-<uid>` suffix (shared `/tmp`), the
+   macOS `/private/tmp` form, a Termux path, and `XDG_RUNTIME_DIR` in the same
+   pool — which suggests Linux may prefer `$XDG_RUNTIME_DIR` (usually
+   `/run/user/<uid>`). Adjacency in a string table is a hint, not proof, so
+   confirm on a real Linux install:
+
+   ```sh
+   jq -r .messagingSocketPath ~/.claude/sessions/*.json
+   ls -la "${XDG_RUNTIME_DIR:-/tmp}"/cc-socks* /tmp/cc-socks* 2>/dev/null
+   ```
+
+   Windows is named pipes rather than unix sockets (`\\.\pipe\<name>`, names
+   built from `process.pid`, daemon pipes matching `cc-daemon-*`), settled with:
 
    ```powershell
    Get-ChildItem \\.\pipe\ | Where-Object Name -like '*cc*'
@@ -199,9 +225,11 @@ These need a machine of each kind; each is a ten-minute check.
    ```
 
    This matters beyond trivia: `peerFeatures` already advertises `notify_idle`
-   and `reply_across_default_dirs`, so there is a plausible future where the
-   monitor answers a waiting session instead of only pointing at it. Spike it
-   before designing the UI, on both platforms.
+   and `reply_across_default_dirs` (that second string sits right next to the
+   socket-directory patterns), so there is a plausible future where the monitor
+   answers a waiting session instead of only pointing at it. Spike it before
+   designing the UI.
+
 3. **WSL path duality.** A session started inside WSL writes to the Linux home;
    a Windows-native session writes to the Windows home. A Windows monitor
    probably has to read both (`\\wsl$\<distro>\home\<user>\.claude`) and label
