@@ -186,6 +186,113 @@ def tail_messages(path, want=14):
         pass
     return out[-want:]
 
+# ---------------------------------------------------------------- perf
+
+_perf = {"at": 0.0, "tree": ({}, {}), "load": (0.0, 1)}
+
+def perf_sample(max_age=5.0):
+    """One ps pass -> per-pid own usage + child map, so a session's whole tree counts."""
+    if time.time() - _perf["at"] < max_age:
+        return _perf
+    kids, own = {}, {}
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,pcpu=,rss="],
+                             capture_output=True, text=True, timeout=20).stdout
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 4:
+                continue
+            pid, ppid = f[0], f[1]
+            own[pid] = (float(f[2]), int(f[3]) * 1024)
+            kids.setdefault(ppid, []).append(pid)
+    except Exception:
+        pass
+    try:
+        load = os.getloadavg()[0]
+    except Exception:
+        load = 0.0
+    _perf.update(at=time.time(), tree=(kids, own), load=(load, os.cpu_count() or 1))
+    return _perf
+
+def tree_usage(pid, depth=0):
+    kids, own = perf_sample()["tree"]
+    pid = str(pid)
+    if depth > 12 or pid not in own:
+        return 0.0, 0
+    cpu, rss = own[pid]
+    for k in kids.get(pid, []):
+        c, r = tree_usage(k, depth + 1)
+        cpu += c
+        rss += r
+    return cpu, rss
+
+# ---------------------------------------------------------------- snapshot
+
+SNAP_DIR = os.path.join(HOME, ".claude", "ccm")
+SNAP = os.path.join(SNAP_DIR, "snapshot.json")
+
+def write_snapshot(rows):
+    """Record the live sessions so they can be brought back after a crash."""
+    live = [r for r in rows if r["live"]]
+    if not live:
+        return None
+    payload = {
+        "savedAt": time.time(),
+        "sessions": [{"sessionId": r["sid"], "cwd": r["cwd"], "name": r["name"],
+                      "status": r["status"]} for r in live],
+    }
+    try:
+        os.makedirs(SNAP_DIR, exist_ok=True)
+        if os.path.exists(SNAP):
+            os.replace(SNAP, os.path.join(SNAP_DIR, "snapshot.prev.json"))
+        tmp = SNAP + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, indent=1)
+        os.replace(tmp, SNAP)
+        return SNAP
+    except Exception:
+        return None
+
+def read_snapshot(path=SNAP):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+def cli_restore(argv):
+    """Reopen the sessions from the last snapshot, one Terminal window each."""
+    snap = read_snapshot()
+    if not snap:
+        print("no snapshot at " + short_path(SNAP))
+        print("one is written every 30s by CCMonitor, or run: ccm snapshot")
+        return
+    rows, _ = load_sessions()
+    live = {r["sid"] for r in rows if r["live"]}
+    saved = snap.get("sessions", [])
+    missing = [s for s in saved if s["sessionId"] not in live]
+    age = human_age(time.time() - snap.get("savedAt", time.time()))
+    print(f"snapshot from {age} ago: {len(saved)} sessions, {len(live & {s['sessionId'] for s in saved})} still running")
+    if not missing:
+        print("nothing to restore — they are all live")
+        return
+    for s in missing:
+        print(f"  {os.path.basename(s['cwd']):24} {s.get('name','')}")
+    if "--yes" not in argv and "-y" not in argv:
+        try:
+            if input(f"restore {len(missing)} session(s)? [y/N] ").strip().lower() != "y":
+                print("cancelled")
+                return
+        except (EOFError, KeyboardInterrupt):
+            print("cancelled")
+            return
+    for s in missing:
+        cmd = f"cd {shq(s['cwd'])} && {shq(CLAUDE_BIN)} --resume {s['sessionId']}"
+        script = f'tell application "Terminal"\n activate\n do script "{cmd}"\nend tell'
+        subprocess.run(["osascript", "-e", script], capture_output=True)
+        print(f"  reopened {os.path.basename(s['cwd'])}")
+        time.sleep(1.2)          # let each one boot before starting the next
+
 # ---------------------------------------------------------------- discovery
 
 def load_live():
@@ -235,6 +342,7 @@ def load_sessions():
                 continue
             info = transcript_info(path, st.st_mtime, st.st_size)
             l = live.get(sid)
+            cpu, rss = tree_usage(l["pid"]) if l else (0.0, 0)
             cwd = (l or {}).get("cwd") or info.get("cwd") or \
                   os.path.basename(root).replace("-", "/")
             rows.append({
@@ -246,6 +354,7 @@ def load_sessions():
                 "status": (l or {}).get("status") or "",
                 "waiting_for": (l or {}).get("waitingFor") or "",
                 "name": (l or {}).get("name") or "",
+                "cpu": cpu, "rss": rss,
             })
             seen.add(sid)
 
@@ -258,7 +367,7 @@ def load_sessions():
             "size": 0, "cwd": l.get("cwd", ""), "title": "(starting up)",
             "branch": "", "live": l, "pid": l.get("pid"),
             "status": l.get("status", ""), "waiting_for": l.get("waitingFor", ""),
-            "name": l.get("name", ""),
+            "name": l.get("name", ""), "cpu": 0.0, "rss": 0,
         })
 
     cache_save()
@@ -338,6 +447,7 @@ HELP = [
     ("l",     "show live sessions only"),
     ("X",     "kill the live session (asks first)"),
     ("c",     "copy the resume command to the clipboard"),
+    ("R",     "restore the sessions from the last snapshot"),
     ("r",     "refresh now   ·   q quit"),
 ]
 
@@ -354,11 +464,15 @@ class App:
         self.preview = None
         self.rows, self.stale = [], []
         self.last_load = 0
+        self.last_snap = 0
         self.reload()
 
     def reload(self):
         self.rows, self.stale = load_sessions()
         self.last_load = time.time()
+        if time.time() - self.last_snap > 30:
+            write_snapshot(self.rows)
+            self.last_snap = time.time()
 
     def visible(self):
         rows = self.rows
@@ -387,8 +501,11 @@ class App:
         nbusy = sum(1 for r in self.rows if r["status"] in ("busy", "shell"))
         nwait = sum(1 for r in self.rows if r["status"] == "waiting")
         head = "  Claude Code sessions"
+        load, cores = perf_sample()["load"]
+        ccpu = sum(r["cpu"] for r in self.rows if r["live"])
         stat = (f"{nwait} NEED YOU · " if nwait else "") + \
-               f"{nlive} live ({nbusy} busy) · {len(self.rows)} total  "
+               f"load {load:.1f}/{cores} · claude {ccpu:.0f}% · " + \
+               f"{nlive} live · {len(self.rows)} total  "
         scr.attron(curses.A_BOLD)
         scr.addnstr(0, 0, head.ljust(w - 1), w - 1)
         scr.attroff(curses.A_BOLD)
@@ -415,11 +532,11 @@ class App:
             self.top = self.sel - list_h + 1
 
         # column widths
-        w_age, w_dir = 5, min(26, max(14, w // 4))
-        w_title = max(10, w - (3 + 6 + w_dir + w_age + 6))
+        w_age, w_dir, w_cpu = 5, min(26, max(14, w // 4)), 5
+        w_title = max(10, w - (3 + 6 + w_dir + w_age + w_cpu + 6))
 
         scr.addnstr(2, 2, f"{'':2} {'STATE':5} {'PROJECT':{w_dir}} "
-                          f"{'WHAT':{w_title}} {'AGE':>{w_age}}"[:w - 3],
+                          f"{'WHAT':{w_title}} {'CPU':>{w_cpu}} {'AGE':>{w_age}}"[:w - 3],
                     w - 3, curses.A_DIM | curses.A_UNDERLINE)
 
         now = time.time()
@@ -448,8 +565,10 @@ class App:
             if r["status"] == "waiting":
                 reason = WAITING_LABEL.get(r["waiting_for"], r["waiting_for"] or "waiting")
                 what = f"[{reason}] {what}"
+            cpu = f"{r['cpu']:.0f}%" if r.get("cpu") else ""
             line = (f" {dot} {state:<5} {proj[:w_dir]:{w_dir}} "
                     f"{what[:w_title]:{w_title}} "
+                    f"{cpu:>{w_cpu}} "
                     f"{human_age(now - r['mtime']):>{w_age}}")
             attr = col
             if sel:
@@ -551,6 +670,17 @@ class App:
             self.sel = 0
         elif c == ord("r"):
             self.reload(); self.note("refreshed", 1)
+        elif c == ord("R"):
+            snap = read_snapshot()
+            n = len(snap.get("sessions", [])) if snap else 0
+            live = {r["sid"] for r in self.rows if r["live"]}
+            miss = [x for x in (snap or {}).get("sessions", []) if x["sessionId"] not in live]
+            if not miss:
+                self.note(f"snapshot has {n} sessions, all already running")
+            elif self.confirm(f"reopen {len(miss)} session(s) from the snapshot?"):
+                curses.endwin()
+                cli_restore(["--yes"])
+                raise SystemExit(0)
         elif c == ord("?"):
             self.help_screen()
         elif c == ord(" ") and cur:
@@ -644,13 +774,20 @@ def cli_list():
             flag = f"\033[32m● {mark:4}\033[0m"
         else:
             flag = "\033[2m·     \033[0m"
-        print(f"{flag} {human_age(time.time()-r['mtime']):>4}  "
-              f"{os.path.basename(r['cwd'])[:20]:20} {r['title'][:70]}")
+        cpu = f"{r['cpu']:4.0f}%" if r.get("cpu") else "     "
+        print(f"{flag} {human_age(time.time()-r['mtime']):>4} {cpu}  "
+              f"{os.path.basename(r['cwd'])[:20]:20} {r['title'][:66]}")
         print(f"        \033[2m{resume_cmd(r)}\033[0m")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("ls", "list", "-l"):
         cli_list()
+    elif len(sys.argv) > 1 and sys.argv[1] == "restore":
+        cli_restore(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "snapshot":
+        rows, _ = load_sessions()
+        f = write_snapshot(rows)
+        print(f"wrote {short_path(f)}" if f else "no live sessions to snapshot")
     elif len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         for k, d in HELP:

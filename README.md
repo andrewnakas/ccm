@@ -44,6 +44,7 @@ auto-start at login and on Terminal launch.
 | `l` | live sessions only |
 | `X` | terminate a live session (asks first) |
 | `c` | copy the `claude --resume …` command |
+| `R` | restore the sessions from the last snapshot |
 | `r` / `q` | refresh / quit |
 
 `ccm ls` prints the same list non-interactively, with resume commands.
@@ -67,6 +68,19 @@ Windows running `claude` with no session file are flagged separately.
 Click any row — Claude session or plain window — and Terminal comes forward with
 that exact tab selected.
 
+Each session row shows the CPU its whole process tree is using, and the strip
+along the bottom shows system load against your core count plus what Claude is
+costing in total:
+
+```
+ ● load 33.4 / 8 cores            claude 486% · 6.1 GB
+```
+
+The load dot goes orange above 1× cores and red above 2×, with the whole strip
+tinted red — on a small machine this is usually the answer to "why is everything
+slow": more concurrent sessions than cores. Hover a row's CPU figure for its
+memory and process count.
+
 Menu bar item: `◉3` working, `✦1` in pink when a session needs you (hover for
 which one). Its menu has:
 
@@ -80,6 +94,28 @@ which one). Its menu has:
 
 `ccmon` launches it, `ccmon quit` stops it, `ccmon rebuild` recompiles after
 editing the Swift source, `ccmon log` shows stderr.
+
+## Crash recovery
+
+CCMonitor writes `~/.claude/ccm/snapshot.json` every 30 seconds (previous copy
+kept alongside), holding each live session's id, cwd and name, plus the working
+directories of your other Terminal windows. `ccm` writes one too, whenever it
+runs.
+
+If Terminal dies, CCMonitor dies, or the machine reboots, bring everything back:
+
+```sh
+ccm restore          # lists what is missing, asks, then reopens each one
+ccm restore --yes    # no prompt
+ccm snapshot         # write one right now
+```
+
+Each restored session gets its own Terminal window running
+`cd <cwd> && claude --resume <id>`, staggered by a second so twelve sessions do
+not boot at once. Sessions that are already running are skipped, so restoring
+twice is harmless. The same thing lives in the menu bar as **Restore N sessions
+from snapshot…**, and if the snapshot holds sessions while none are running,
+CCMonitor says so in a notification rather than waiting to be asked.
 
 ## How it works
 
@@ -97,6 +133,15 @@ editing the Swift source, `ccmon log` shows stderr.
   matched exactly rather than guessed from a title.
 - **Identifying plain windows**: one `ps` pass plus one batched `lsof -d cwd`
   resolves every shell's working directory.
+- **Performance**: a single `ps -axo pid=,ppid=,pcpu=,rss=` pass builds the
+  process tree, so a session's cost includes every child it spawned; load comes
+  from `getloadavg(3)`.
+- **Staying cheap**: every source has its own cadence and they all run on one
+  serial queue, so a slow pass can never overlap the next tick. Reading session
+  JSON is every 2s, `ps` every 6s, `lsof` every 60s, and the AppleScript window
+  inventory — which takes seconds once you have 30+ windows — every 25s and
+  *only while the panel is on screen*. Steady-state cost is about 3% of one
+  core.
 
 ## Linux and Windows
 
