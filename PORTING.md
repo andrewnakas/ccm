@@ -185,11 +185,23 @@ These need a machine of each kind; each is a ten-minute check.
 1. **Does Claude Code on Windows write `%USERPROFILE%\.claude\sessions\<pid>.json`
    at all, and what is `pidDomain` there?** The whole plan rests on it. Same
    question for native Linux (expected: `linux`, path unchanged).
-2. **What is `messagingSocketPath` on Windows?** If it is a named pipe, there
-   may be a supported way to talk to a session directly — `peerFeatures`
-   already advertises `notify_idle` and `reply_across_default_dirs`, which
-   suggests a future where the monitor can answer a session rather than only
-   point at it. Worth a spike before designing the UI.
+2. **What is `messagingSocketPath` on Windows?** Partly answered by reading the
+   CLI binary: Windows uses named pipes rather than unix sockets — the strings
+   show `\\.\pipe\<name>` construction, pipe names built from `process.pid`,
+   and a daemon pipe pattern `\\.\pipe\cc-daemon-*` (the macOS analogue being
+   `/tmp/cc-socks/<pid>.sock`). The remaining unknown is the exact per-session
+   pipe name, which a Windows install answers in one command:
+
+   ```powershell
+   Get-ChildItem \\.\pipe\ | Where-Object Name -like '*cc*'
+   Get-Content $env:USERPROFILE\.claude\sessions\*.json | ConvertFrom-Json |
+     Select-Object pid,status,waitingFor,pidDomain,messagingSocketPath
+   ```
+
+   This matters beyond trivia: `peerFeatures` already advertises `notify_idle`
+   and `reply_across_default_dirs`, so there is a plausible future where the
+   monitor answers a waiting session instead of only pointing at it. Spike it
+   before designing the UI, on both platforms.
 3. **WSL path duality.** A session started inside WSL writes to the Linux home;
    a Windows-native session writes to the Windows home. A Windows monitor
    probably has to read both (`\\wsl$\<distro>\home\<user>\.claude`) and label
