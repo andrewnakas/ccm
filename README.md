@@ -98,6 +98,16 @@ editing the Swift source, `ccmon log` shows stderr.
 - **Identifying plain windows**: one `ps` pass plus one batched `lsof -d cwd`
   resolves every shell's working directory.
 
+## Linux and Windows
+
+Not yet — but the port is planned rather than hand-waved: see
+[PORTING.md](PORTING.md) for what ports for free (all of the session state),
+what has to be rebuilt per platform (revealing a session's terminal, the tray
+UI), a capability matrix per desktop, and the order of work. Short version:
+tmux gives exact tab switching on every OS, X11 and wlroots compositors can
+raise the right window, and Windows Terminal cannot currently be told to switch
+to an existing tab at all.
+
 ## Caveats
 
 - Apple Terminal only (the AppleScript tab model is Terminal's).
