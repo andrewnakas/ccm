@@ -1,0 +1,4 @@
+CCMonitor/CCMonitor
+*.dSYM/
+build/
+.DS_Store

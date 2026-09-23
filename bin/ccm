@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""ccm - Claude Code session organizer for macOS Terminal.app
+
+Live sessions come from ~/.claude/sessions/<pid>.json (pid, cwd, status, name).
+Past sessions come from ~/.claude/projects/*/<session-id>.jsonl.
+Enter on a live session jumps to the Terminal tab running it (matched by tty).
+Enter on a past session resumes it in a new Terminal window.
+"""
+import curses, json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+SESSIONS_DIR = os.path.join(HOME, ".claude", "sessions")
+PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
+CACHE_FILE = os.path.join(HOME, ".claude", "cache", "ccm-titles.json")
+CLAUDE_BIN = os.path.join(HOME, ".local", "bin", "claude")
+if not os.path.exists(CLAUDE_BIN):
+    CLAUDE_BIN = "claude"
+
+STATE_LABEL = {"busy": "busy", "shell": "shell", "idle": "idle", "waiting": "NEEDS"}
+WAITING_LABEL = {"dialog open": "needs approval", "input needed": "asked you a question",
+                 "goal proposal": "wants a goal", "sandbox request": "sandbox request"}
+
+SKIP_PREFIXES = ("<local-command-caveat>", "<command-name>", "<command-message>",
+                 "Caveat:", "<system-reminder>", "<user-prompt-submit-hook>",
+                 "<local-command-stdout>", "<local-command-stderr>",
+                 "[Request interrupted", "API Error", "tool_result",
+                 "Base directory for this skill", "<user-memory-input>",
+                 "<task-notification>", "<bash-stdout>", "<bash-stderr>")
+
+# ---------------------------------------------------------------- utilities
+
+def human_age(seconds):
+    s = int(max(0, seconds))
+    if s < 60:   return f"{s}s"
+    if s < 3600: return f"{s//60}m"
+    if s < 86400:
+        h, m = divmod(s // 60, 60)
+        return f"{h}h{m:02d}" if h < 10 else f"{h}h"
+    d = s // 86400
+    return f"{d}d" if d < 7 else f"{d//7}w"
+
+def human_size(n):
+    for unit, div in (("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)):
+        if n >= div:
+            return f"{n/div:.0f}{unit}"
+    return f"{n}B"
+
+def short_path(p):
+    return p.replace(HOME, "~", 1) if p.startswith(HOME) else p
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+
+def osascript(script):
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True,
+                           text=True, timeout=12)
+        return r.returncode == 0, (r.stdout or r.stderr).strip()
+    except Exception as e:
+        return False, str(e)
+
+def q(s):
+    """Quote for embedding in an AppleScript string literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+# ---------------------------------------------------------------- transcripts
+
+_cache = None
+
+def cache_load():
+    global _cache
+    if _cache is None:
+        try:
+            with open(CACHE_FILE) as fh:
+                _cache = json.load(fh)
+        except Exception:
+            _cache = {}
+    return _cache
+
+def cache_save():
+    if _cache is None:
+        return
+    try:
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(_cache, fh)
+        os.replace(tmp, CACHE_FILE)
+    except Exception:
+        pass
+
+def text_of(msg):
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = [b.get("text", "") for b in c
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+def clean(s, limit=400):
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s[:limit]
+
+def scan_transcript(path):
+    """Best available label for a transcript, plus cwd/branch, from its head."""
+    title = cwd = branch = summary = cmd = assistant = ""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 2000 or (title and cwd):
+                    break
+                if len(line) > 400_000:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if not cwd and rec.get("cwd"):
+                    cwd = rec["cwd"]
+                    branch = rec.get("gitBranch") or ""
+                if not summary and rec.get("type") == "summary":
+                    summary = clean(rec.get("summary") or "")
+                if rec.get("type") == "user" and not title:
+                    t = clean(text_of(rec.get("message") or {}))
+                    if not t:
+                        continue
+                    m = re.search(r"<command-name>\s*([^<\s]+)", t)
+                    if m and not cmd:
+                        cmd = m.group(1) if m.group(1).startswith("/") else "/" + m.group(1)
+                    if not t.startswith(SKIP_PREFIXES):
+                        title = t
+                elif rec.get("type") == "assistant" and not assistant:
+                    assistant = clean(text_of(rec.get("message") or {}), 200)
+    except Exception:
+        pass
+    if not title:
+        if summary:
+            title = summary
+        elif cmd and assistant:
+            title = f"{cmd} → {assistant}"
+        elif cmd:
+            title = cmd
+        elif assistant:
+            title = "↳ " + assistant
+    return {"title": title, "cwd": cwd, "branch": branch}
+
+def transcript_info(path, mtime, size):
+    c = cache_load()
+    key = path
+    hit = c.get(key)
+    if hit and hit.get("mtime") == int(mtime) and hit.get("size") == size:
+        return hit
+    info = scan_transcript(path)
+    info.update(mtime=int(mtime), size=size)
+    c[key] = info
+    return info
+
+def tail_messages(path, want=14):
+    """Last few human-readable turns, for the preview pane."""
+    out = []
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - 400_000))
+            chunk = fh.read()
+        for line in chunk.split(b"\n")[1:]:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") not in ("user", "assistant"):
+                continue
+            msg = rec.get("message") or {}
+            t = clean(text_of(msg), 2000)
+            if not t or t.startswith(SKIP_PREFIXES):
+                continue
+            out.append((rec["type"], rec.get("timestamp", ""), t))
+    except Exception:
+        pass
+    return out[-want:]
+
+# ---------------------------------------------------------------- discovery
+
+def load_live():
+    live = {}
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return live
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        p = os.path.join(SESSIONS_DIR, fn)
+        try:
+            with open(p) as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        pid = d.get("pid")
+        sid = d.get("sessionId")
+        if not pid or not sid:
+            continue
+        if not pid_alive(int(pid)):
+            d["_stale_file"] = p
+            live.setdefault("_stale", []).append(d)
+            continue
+        live[sid] = d
+    return live
+
+def load_sessions():
+    live = load_live()
+    stale = live.pop("_stale", [])
+    rows, seen = [], set()
+
+    for root, _dirs, files in os.walk(PROJECTS_DIR):
+        for fn in files:
+            if not fn.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, fn)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_size < 200:
+                continue
+            sid = fn[:-6]
+            if sid.startswith("agent-"):   # subagent transcripts, not sessions
+                continue
+            info = transcript_info(path, st.st_mtime, st.st_size)
+            l = live.get(sid)
+            cwd = (l or {}).get("cwd") or info.get("cwd") or \
+                  os.path.basename(root).replace("-", "/")
+            rows.append({
+                "sid": sid, "path": path, "mtime": st.st_mtime,
+                "size": st.st_size, "cwd": cwd,
+                "title": info.get("title") or "(no prompt yet)",
+                "branch": info.get("branch") or "",
+                "live": l, "pid": (l or {}).get("pid"),
+                "status": (l or {}).get("status") or "",
+                "waiting_for": (l or {}).get("waitingFor") or "",
+                "name": (l or {}).get("name") or "",
+            })
+            seen.add(sid)
+
+    # a live session whose transcript has not landed on disk yet
+    for sid, l in live.items():
+        if sid in seen:
+            continue
+        rows.append({
+            "sid": sid, "path": "", "mtime": (l.get("updatedAt", 0) or 0) / 1000,
+            "size": 0, "cwd": l.get("cwd", ""), "title": "(starting up)",
+            "branch": "", "live": l, "pid": l.get("pid"),
+            "status": l.get("status", ""), "waiting_for": l.get("waitingFor", ""),
+            "name": l.get("name", ""),
+        })
+
+    cache_save()
+    rows.sort(key=lambda r: (r["status"] == "waiting", r["live"] is not None, r["mtime"]),
+              reverse=True)
+    return rows, stale
+
+# ---------------------------------------------------------------- actions
+
+def tty_of(pid):
+    try:
+        t = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=5).stdout.strip()
+        return "/dev/" + t if t and t != "??" else ""
+    except Exception:
+        return ""
+
+def focus_tab(pid):
+    tty = tty_of(pid)
+    if not tty:
+        return False, "no tty for that process (not a Terminal session?)"
+    script = f'''
+tell application "Terminal"
+  repeat with w from 1 to count windows
+    repeat with t from 1 to count tabs of window w
+      if (tty of tab t of window w) is "{q(tty)}" then
+        set selected tab of window w to tab t of window w
+        set index of window w to 1
+        activate
+        return "ok"
+      end if
+    end repeat
+  end repeat
+end tell
+return "notfound"'''
+    ok, out = osascript(script)
+    if ok and out == "ok":
+        return True, f"jumped to {tty}"
+    return False, f"no Terminal tab on {tty} (different terminal app?)"
+
+def run_in_terminal(cmd, new_tab=False):
+    if new_tab:
+        script = f'''
+tell application "Terminal" to activate
+delay 0.2
+tell application "System Events" to keystroke "t" using command down
+delay 0.4
+tell application "Terminal" to do script "{q(cmd)}" in front window'''
+        ok, out = osascript(script)
+        if ok:
+            return True, "opened in a new tab"
+    script = f'''
+tell application "Terminal"
+  activate
+  do script "{q(cmd)}"
+end tell
+return "ok"'''
+    ok, out = osascript(script)
+    return ok, ("opened in a new window" if ok else out)
+
+def resume_cmd(row, fork=False):
+    f = " --fork-session" if fork else ""
+    return f"cd {shq(row['cwd'])} && {shq(CLAUDE_BIN)} --resume {row['sid']}{f}"
+
+def shq(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+# ---------------------------------------------------------------- ui
+
+HELP = [
+    ("enter", "jump to live tab / resume past session"),
+    ("t",     "same, but in a new tab of the front window"),
+    ("f",     "resume as a fork (new session id, keeps the old one)"),
+    ("n",     "new session in that project directory"),
+    ("space", "preview the last messages"),
+    ("/",     "filter   ·   esc clears"),
+    ("l",     "show live sessions only"),
+    ("X",     "kill the live session (asks first)"),
+    ("c",     "copy the resume command to the clipboard"),
+    ("r",     "refresh now   ·   q quit"),
+]
+
+class App:
+    def __init__(self, scr):
+        self.scr = scr
+        self.sel = 0
+        self.top = 0
+        self.filter = ""
+        self.typing = False
+        self.live_only = False
+        self.msg = ""
+        self.msg_until = 0
+        self.preview = None
+        self.rows, self.stale = [], []
+        self.last_load = 0
+        self.reload()
+
+    def reload(self):
+        self.rows, self.stale = load_sessions()
+        self.last_load = time.time()
+
+    def visible(self):
+        rows = self.rows
+        if self.live_only:
+            rows = [r for r in rows if r["live"]]
+        if self.filter:
+            f = self.filter.lower()
+            rows = [r for r in rows
+                    if f in r["title"].lower() or f in r["cwd"].lower()
+                    or f in (r["name"] or "").lower() or f in r["sid"]]
+        return rows
+
+    def note(self, text, secs=4):
+        self.msg, self.msg_until = text, time.time() + secs
+
+    # -- drawing ------------------------------------------------------
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        rows = self.visible()
+        if self.sel >= len(rows):
+            self.sel = max(0, len(rows) - 1)
+
+        nlive = sum(1 for r in self.rows if r["live"])
+        nbusy = sum(1 for r in self.rows if r["status"] in ("busy", "shell"))
+        nwait = sum(1 for r in self.rows if r["status"] == "waiting")
+        head = "  Claude Code sessions"
+        stat = (f"{nwait} NEED YOU · " if nwait else "") + \
+               f"{nlive} live ({nbusy} busy) · {len(self.rows)} total  "
+        scr.attron(curses.A_BOLD)
+        scr.addnstr(0, 0, head.ljust(w - 1), w - 1)
+        scr.attroff(curses.A_BOLD)
+        if len(stat) + len(head) + 2 < w:
+            scr.addnstr(0, w - 1 - len(stat), stat, len(stat), curses.A_DIM)
+
+        if self.typing or self.filter:
+            bar = f"  /{self.filter}" + ("_" if self.typing else "")
+            scr.addnstr(1, 0, bar.ljust(w - 1), w - 1, curses.A_BOLD)
+        else:
+            hint = "  enter jump/resume · t tab · f fork · n new · space preview · / filter · ? help · q quit"
+            scr.addnstr(1, 0, hint[:w - 1], w - 1, curses.A_DIM)
+
+        list_top = 3
+        foot_h = 2
+        prev_h = 0
+        if self.preview is not None:
+            prev_h = min(12, max(6, h // 3))
+        list_h = max(3, h - list_top - foot_h - prev_h)
+
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + list_h:
+            self.top = self.sel - list_h + 1
+
+        # column widths
+        w_age, w_dir = 5, min(26, max(14, w // 4))
+        w_title = max(10, w - (3 + 6 + w_dir + w_age + 6))
+
+        scr.addnstr(2, 2, f"{'':2} {'STATE':5} {'PROJECT':{w_dir}} "
+                          f"{'WHAT':{w_title}} {'AGE':>{w_age}}"[:w - 3],
+                    w - 3, curses.A_DIM | curses.A_UNDERLINE)
+
+        now = time.time()
+        for i in range(self.top, min(len(rows), self.top + list_h)):
+            r = rows[i]
+            y = list_top + (i - self.top)
+            sel = (i == self.sel)
+            if r["status"] == "waiting":
+                dot, col = "◆", curses.color_pair(6)   # magenta — blocked on you
+            elif r["status"] in ("busy", "shell"):
+                dot, col = "●", curses.color_pair(2)   # yellow
+            elif r["live"]:
+                dot, col = "●", curses.color_pair(1)   # green
+            else:
+                dot, col = "·", curses.color_pair(4)   # dim
+            state = STATE_LABEL.get(r["status"], r["status"][:5]) if r["live"] \
+                else human_size(r["size"])
+            base = os.path.basename(r["cwd"].rstrip("/")) or r["cwd"]
+            proj = base[:w_dir]
+            extra = r["name"] or (r["branch"] if r["branch"] != "HEAD" else "")
+            room = w_dir - len(proj) - 3
+            if extra and room >= 6:
+                sep = ("[", "]") if r["name"] else ("(", ")")
+                proj = f"{proj} {sep[0]}{extra[:room]}{sep[1]}"
+            what = r["title"]
+            if r["status"] == "waiting":
+                reason = WAITING_LABEL.get(r["waiting_for"], r["waiting_for"] or "waiting")
+                what = f"[{reason}] {what}"
+            line = (f" {dot} {state:<5} {proj[:w_dir]:{w_dir}} "
+                    f"{what[:w_title]:{w_title}} "
+                    f"{human_age(now - r['mtime']):>{w_age}}")
+            attr = col
+            if sel:
+                attr = curses.color_pair(3) | curses.A_BOLD
+            scr.addnstr(y, 1, line[:w - 2].ljust(w - 2), w - 2, attr)
+
+        if not rows:
+            scr.addnstr(list_top, 2, "no sessions match", w - 3, curses.A_DIM)
+
+        # preview pane
+        if self.preview is not None and prev_h > 2:
+            py = h - foot_h - prev_h
+            scr.addnstr(py, 1, ("─ preview " + "─" * w)[:w - 2], w - 2, curses.A_DIM)
+            lines = []
+            for who, ts, text in self.preview:
+                tag = "you" if who == "user" else "claude"
+                pc = curses.color_pair(5) if who == "user" else curses.color_pair(4)
+                for seg in [text[i:i + (w - 12)] for i in range(0, min(len(text), (w - 12) * 2), w - 12)]:
+                    lines.append((tag, seg, pc))
+                    tag = ""
+            for j, (tag, seg, pc) in enumerate(lines[-(prev_h - 1):]):
+                scr.addnstr(py + 1 + j, 2, f"{tag:>6} {seg}"[:w - 3], w - 3, pc)
+
+        # footer
+        fy = h - 1
+        if self.msg and time.time() < self.msg_until:
+            scr.addnstr(fy, 1, self.msg[:w - 2], w - 2, curses.color_pair(2) | curses.A_BOLD)
+        elif rows:
+            r = rows[self.sel]
+            tail = f"{short_path(r['cwd'])}  ·  {r['sid'][:8]}"
+            if r["pid"]:
+                tail += f"  ·  pid {r['pid']}  tty {tty_of(r['pid']) or '?'}"
+            if self.stale:
+                tail += f"  ·  {len(self.stale)} stale (press S to clean)"
+            scr.addnstr(fy, 1, tail[:w - 2], w - 2, curses.A_DIM)
+        scr.refresh()
+
+    def help_screen(self):
+        scr = self.scr
+        scr.erase()
+        scr.addnstr(1, 2, "ccm — Claude Code session organizer", 60, curses.A_BOLD)
+        for i, (k, d) in enumerate(HELP):
+            scr.addnstr(3 + i, 4, f"{k:>6}   {d}", 78)
+        scr.addnstr(4 + len(HELP), 4, "Live sessions are read from ~/.claude/sessions;", 78, curses.A_DIM)
+        scr.addnstr(5 + len(HELP), 4, "past ones from ~/.claude/projects. Refreshes every 2s.", 78, curses.A_DIM)
+        scr.addnstr(7 + len(HELP), 4, "press any key", 40, curses.A_DIM)
+        scr.refresh()
+        scr.timeout(-1)
+        scr.getch()
+        scr.timeout(700)
+
+    def confirm(self, prompt):
+        h, w = self.scr.getmaxyx()
+        self.scr.addnstr(h - 1, 1, (prompt + " [y/N] ").ljust(w - 2)[:w - 2],
+                         w - 2, curses.color_pair(2) | curses.A_BOLD)
+        self.scr.refresh()
+        self.scr.timeout(-1)
+        c = self.scr.getch()
+        self.scr.timeout(700)
+        return c in (ord("y"), ord("Y"))
+
+    # -- input --------------------------------------------------------
+    def handle(self, c):
+        rows = self.visible()
+        cur = rows[self.sel] if rows else None
+
+        if self.typing:
+            if c in (27,):                       # esc
+                self.typing, self.filter = False, ""
+            elif c in (10, 13):
+                self.typing = False
+            elif c in (curses.KEY_BACKSPACE, 127, 8):
+                self.filter = self.filter[:-1]
+            elif 32 <= c < 127:
+                self.filter += chr(c)
+                self.sel = 0
+            return True
+
+        if c in (ord("q"),):
+            return False
+        elif c in (curses.KEY_DOWN, ord("j")):
+            self.sel = min(self.sel + 1, max(0, len(rows) - 1))
+        elif c in (curses.KEY_UP, ord("k")):
+            self.sel = max(0, self.sel - 1)
+        elif c in (curses.KEY_NPAGE, 6):
+            self.sel = min(self.sel + 10, max(0, len(rows) - 1))
+        elif c in (curses.KEY_PPAGE, 2):
+            self.sel = max(0, self.sel - 10)
+        elif c == curses.KEY_HOME or c == ord("g"):
+            self.sel = 0
+        elif c == curses.KEY_END or c == ord("G"):
+            self.sel = max(0, len(rows) - 1)
+        elif c == ord("/"):
+            self.typing = True
+        elif c == 27:
+            self.filter, self.preview = "", None
+        elif c == ord("l"):
+            self.live_only = not self.live_only
+            self.sel = 0
+        elif c == ord("r"):
+            self.reload(); self.note("refreshed", 1)
+        elif c == ord("?"):
+            self.help_screen()
+        elif c == ord(" ") and cur:
+            self.preview = None if self.preview is not None else \
+                (tail_messages(cur["path"]) if cur["path"] else [])
+        elif c in (10, 13) and cur:
+            self.open(cur, new_tab=False)
+        elif c == ord("t") and cur:
+            self.open(cur, new_tab=True)
+        elif c == ord("f") and cur:
+            if cur["live"]:
+                self.note("that session is live — press enter to jump to it")
+            else:
+                ok, m = run_in_terminal(resume_cmd(cur, fork=True))
+                self.note(("forked · " if ok else "failed · ") + m)
+        elif c == ord("n") and cur:
+            ok, m = run_in_terminal(f"cd {shq(cur['cwd'])} && {shq(CLAUDE_BIN)}")
+            self.note(("new session · " if ok else "failed · ") + m)
+        elif c == ord("c") and cur:
+            cmd = resume_cmd(cur)
+            try:
+                subprocess.run(["pbcopy"], input=cmd, text=True, timeout=5)
+                self.note("copied: " + cmd[:70])
+            except Exception as e:
+                self.note(f"copy failed: {e}")
+        elif c == ord("X") and cur:
+            if not cur["live"]:
+                self.note("not a live session")
+            elif self.confirm(f"kill pid {cur['pid']} in {short_path(cur['cwd'])}?"):
+                try:
+                    os.kill(int(cur["pid"]), 15)
+                    self.note(f"sent SIGTERM to {cur['pid']}")
+                except Exception as e:
+                    self.note(f"kill failed: {e}")
+                time.sleep(0.3); self.reload()
+        elif c == ord("S") and self.stale:
+            n = 0
+            for d in self.stale:
+                try:
+                    os.remove(d["_stale_file"]); n += 1
+                except Exception:
+                    pass
+            self.reload(); self.note(f"removed {n} stale session files")
+        return True
+
+    def open(self, row, new_tab):
+        if row["live"]:
+            ok, m = focus_tab(row["pid"])
+            if ok:
+                self.note(m, 2)
+                curses.endwin()            # give the focus to Terminal cleanly
+                raise SystemExit(0)
+            self.note("could not jump · " + m)
+            return
+        ok, m = run_in_terminal(resume_cmd(row), new_tab=new_tab)
+        self.note(("resuming · " if ok else "failed · ") + m)
+        if ok:
+            curses.endwin()
+            raise SystemExit(0)
+
+    def loop(self):
+        self.scr.timeout(700)
+        while True:
+            self.draw()
+            c = self.scr.getch()
+            if c != -1 and not self.handle(c):
+                break
+            if time.time() - self.last_load > 2:
+                self.reload()
+
+def main(scr):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    for i, fg in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW), start=1):
+        curses.init_pair(i, fg, -1)
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(4, curses.COLOR_WHITE, -1)
+    curses.init_pair(5, curses.COLOR_CYAN, -1)
+    curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+    App(scr).loop()
+
+def cli_list():
+    rows, _ = load_sessions()
+    for r in rows[:40]:
+        mark = STATE_LABEL.get(r["status"], "")
+        if r["status"] == "waiting":
+            flag = f"\033[35;1m◆ {mark:4}\033[0m"
+        elif r["status"] in ("busy", "shell"):
+            flag = f"\033[33m● {mark:4}\033[0m"
+        elif r["live"]:
+            flag = f"\033[32m● {mark:4}\033[0m"
+        else:
+            flag = "\033[2m·     \033[0m"
+        print(f"{flag} {human_age(time.time()-r['mtime']):>4}  "
+              f"{os.path.basename(r['cwd'])[:20]:20} {r['title'][:70]}")
+        print(f"        \033[2m{resume_cmd(r)}\033[0m")
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("ls", "list", "-l"):
+        cli_list()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        for k, d in HELP:
+            print(f"  {k:>6}   {d}")
+    else:
+        try:
+            curses.wrapper(main)
+        except KeyboardInterrupt:
+            pass

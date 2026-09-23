@@ -1,0 +1,27 @@
+#!/bin/sh
+# Launch / stop / rebuild the CCMonitor floating panel.
+SELF=$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")
+REPO=$(dirname "$(dirname "$SELF")")
+APP="$HOME/Applications/CCMonitor.app"
+
+case "$1" in
+  quit|stop)
+    pkill -f "CCMonitor.app" && echo "CCMonitor stopped"
+    ;;
+  rebuild)
+    set -e
+    swiftc -O -parse-as-library "$REPO/CCMonitor/CCMonitor.swift" -o "$REPO/CCMonitor/CCMonitor"
+    pkill -f "CCMonitor.app" 2>/dev/null || true
+    sleep 1
+    cp "$REPO/CCMonitor/CCMonitor" "$APP/Contents/MacOS/CCMonitor"
+    codesign --force --deep -s - "$APP" >/dev/null 2>&1 || true
+    open "$APP"
+    echo "rebuilt + relaunched"
+    ;;
+  log)
+    tail -n 40 /tmp/ccmonitor.err.log 2>/dev/null || echo "(no log yet)"
+    ;;
+  *)
+    open "$APP"
+    ;;
+esac

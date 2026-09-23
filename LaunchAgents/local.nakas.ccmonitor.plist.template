@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.nakas.ccmonitor</string>
+  <key>ProgramArguments</key>
+  <array><string>__HOME__/Applications/CCMonitor.app/Contents/MacOS/CCMonitor</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardErrorPath</key><string>/tmp/ccmonitor.err.log</string>
+</dict>
+</plist>
